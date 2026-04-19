@@ -1,0 +1,18 @@
+name: hookbus-publisher
+version: 0.2.0
+description: Publish hermes-agent lifecycle events to HookBus, a vendor-neutral agent governance bus. Enforces pre-tool-call policy via CRE or any HookBus subscriber.
+author: Agentic Thinking Ltd <contact@agenticthinking.uk>
+requires_env:
+  - name: HOOKBUS_URL
+    description: "HookBus HTTP endpoint, e.g. http://hookbus.example.com:18800/event"
+    required: false
+  - name: HOOKBUS_TOKEN
+    description: "Bearer token shared with the bus. Read via: docker exec hookbus cat /root/.hookbus/.token. Required for authenticated buses (default since HookBus 0.1)."
+    required: true
+  - name: HOOKBUS_FAIL_MODE
+    description: "Behaviour when bus is unreachable: 'open' (allow) or 'closed' (deny). Default 'open'."
+    required: false
+provides_hooks:
+  - pre_tool_call
+  - post_tool_call
+  - post_api_request
