@@ -5,7 +5,7 @@
 #   1. Clones NousResearch/hermes-agent into ~/hermes-agent if missing
 #   2. Creates a Python venv at ~/hermes-agent/venv
 #   3. Installs hermes itself + requirements.txt + python-dotenv (defensive)
-#   4. Copies this plugin\s __init__.py + plugin.yaml into ~/hermes-agent/plugins/hookbus-publisher/
+#   4. Copies this plugin\s __init__.py + plugin.yaml into ~/.hermes/plugins/hookbus-publisher/ (user plugin dir hermes actually scans)
 #   5. Scaffolds ~/hermes-agent/.env from .env.example if missing
 #   6. Prompts for MINIMAX_API_KEY if not present
 #
@@ -49,10 +49,13 @@ if [[ -f "$HERMES_DIR/requirements.txt" ]]; then
 fi
 
 # 4. Plugin install
-mkdir -p "$HERMES_DIR/plugins/hookbus-publisher"
-cp "$PLUGIN_SRC/__init__.py" "$HERMES_DIR/plugins/hookbus-publisher/"
-cp "$PLUGIN_SRC/plugin.yaml" "$HERMES_DIR/plugins/hookbus-publisher/"
-say "plugin installed at $HERMES_DIR/plugins/hookbus-publisher/"
+# hermes plugin discovery scans ~/.hermes/plugins/<name>/ and ./.hermes/plugins/<name>/.
+# It does NOT scan $HERMES_DIR/plugins/, so installing there leaves the plugin dark.
+HERMES_USER_PLUGIN_DIR="$HOME/.hermes/plugins/hookbus-publisher"
+mkdir -p "$HERMES_USER_PLUGIN_DIR"
+cp "$PLUGIN_SRC/__init__.py" "$HERMES_USER_PLUGIN_DIR/"
+cp "$PLUGIN_SRC/plugin.yaml" "$HERMES_USER_PLUGIN_DIR/"
+say "plugin installed at $HERMES_USER_PLUGIN_DIR/"
 
 # 5. .env scaffold
 if [[ ! -f "$HERMES_DIR/.env" ]]; then
@@ -96,6 +99,6 @@ if ! grep -qE "^MINIMAX_API_KEY=.+" "$HERMES_DIR/.env"; then
 fi
 
 say "install complete."
-say "Plugin:      $HERMES_DIR/plugins/hookbus-publisher/"
+say "Plugin:      $HERMES_USER_PLUGIN_DIR/"
 say "Bus target:  $HOOKBUS_URL"
 say "Start chat:  $HERMES_DIR/hermes chat"

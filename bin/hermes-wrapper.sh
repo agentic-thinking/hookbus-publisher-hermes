@@ -72,10 +72,12 @@ if (( need_install )); then
     # Install HookBus publisher plugin from local source if provided.
     # Otherwise the user installs via: hermes plugins install <git-url>.
     if [[ -n "$SHIM_SRC" && -f "$SHIM_SRC/__init__.py" ]]; then
+        # hermes plugin discovery only scans ~/.hermes/plugins/ and ./.hermes/plugins/.
         say "installing HookBus publisher plugin from $SHIM_SRC"
-        mkdir -p "$HERMES_DIR/plugins/hookbus-publisher"
-        cp "$SHIM_SRC/__init__.py"   "$HERMES_DIR/plugins/hookbus-publisher/"
-        [[ -f "$SHIM_SRC/plugin.yaml" ]] && cp "$SHIM_SRC/plugin.yaml" "$HERMES_DIR/plugins/hookbus-publisher/"
+        HERMES_USER_PLUGIN_DIR="$HOME/.hermes/plugins/hookbus-publisher"
+        mkdir -p "$HERMES_USER_PLUGIN_DIR"
+        cp "$SHIM_SRC/__init__.py"   "$HERMES_USER_PLUGIN_DIR/"
+        [[ -f "$SHIM_SRC/plugin.yaml" ]] && cp "$SHIM_SRC/plugin.yaml" "$HERMES_USER_PLUGIN_DIR/"
     else
         warn "HERMES_SHIM_SRC not set or plugin source missing."
         warn "Install via:  hermes plugins install https://github.com/agentic-thinking/hookbus-publisher-hermes"
