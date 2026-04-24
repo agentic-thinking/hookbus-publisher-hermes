@@ -3,9 +3,10 @@
 Emits lifecycle events to a HookBus endpoint and enforces subscriber verdicts.
 
 Hooks registered:
+- pre_api_request -> PreLLMCall event (sync, can block/budget)
+- post_api_request -> PostLLMCall event (carries exact model + token usage)
 - pre_tool_call  -> PreToolUse event (sync, can block)
 - post_tool_call -> PostToolUse event (observation)
-- post_api_request -> PostLLMCall event (carries exact model + token usage)
 
 Tool events are tagged with the most recently seen model/provider from the
 post_api_request hook, so even subscribers that only see tool events get
@@ -36,7 +37,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 logger = logging.getLogger(__name__)
 if os.environ.get("HOOKBUS_DEBUG", "") == "1":
@@ -46,11 +47,16 @@ _DEFAULT_URL = "http://localhost:18800/event"
 _DEFAULT_TIMEOUT = 10
 _DEFAULT_FAIL_MODE = "closed"  # fail-safe: bus unreachable = deny. Set HOOKBUS_FAIL_MODE=open to allow on bus downtime (dev only).
 
+SCHEMA_VERSION = 1
+
 
 # Cached from the most recent post_api_request so tool-call events can be
 # tagged with the model that selected them. Reset per process.
 _LAST_MODEL: str = ""
 _LAST_PROVIDER: str = ""
+
+# correlation_id cache: keyed by tool_call_id (tools) or task_id (LLM calls)
+_CORRELATIONS: Dict[str, str] = {}
 
 
 def _config() -> Dict[str, Any]:
@@ -151,17 +157,21 @@ def _build_envelope(
     session_id: str = "",
     tool_call_id: str = "",
     task_id: str = "",
+    correlation_id: str = "",
     extra: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     cfg = _config()
     return {
+        "schema_version": SCHEMA_VERSION,
         "event_id": str(uuid.uuid4()),
         "event_type": event_type,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "source": cfg["source"],
+        "agent_id": cfg["source"],
         "session_id": session_id or "default",
         "tool_name": tool_name,
         "tool_input": tool_input or {},
+        "correlation_id": correlation_id,
         "metadata": _merge_meta({
             "publisher": "hookbus-hermes-publisher",
             "publisher_version": __version__,
@@ -175,6 +185,112 @@ def _build_envelope(
 # hermes-agent hook callbacks
 # ---------------------------------------------------------------------------
 
+def on_pre_api_request(
+    model: str = "",
+    provider: str = "",
+    session_id: str = "",
+    task_id: str = "",
+    **_ignore: Any,
+) -> Optional[Dict[str, Any]]:
+    """Called by hermes-agent before an LLM API call.
+
+    Emits PreLLMCall to HookBus. If any subscriber returns `deny`, block.
+    """
+    corr = str(uuid.uuid4())
+    cache_key = task_id or session_id or "default"
+    _CORRELATIONS[cache_key] = corr
+
+    envelope = _build_envelope(
+        event_type="PreLLMCall",
+        tool_name="llm.api_request",
+        tool_input={},
+        session_id=session_id,
+        task_id=task_id,
+        correlation_id=corr,
+    )
+
+    verdict = _post_event(envelope)
+    cfg = _config()
+
+    if verdict is None:
+        if cfg["fail_mode"] == "closed":
+            return {
+                "action": "block",
+                "message": "HookBus unreachable and fail_mode=closed, LLM call denied.",
+            }
+        return None
+
+    decision = str(verdict.get("decision", "allow")).lower()
+    reason = verdict.get("reason", "") or ""
+
+    if decision == "deny":
+        return {
+            "action": "block",
+            "message": reason or "Blocked by HookBus subscriber (no reason given).",
+        }
+    if decision not in ("allow", "ask"):
+        logger.warning("hookbus returned unknown decision '%s' for PreLLMCall, defaulting to allow", decision)
+    return None
+
+
+def on_post_api_request(
+    model: str = "",
+    provider: str = "",
+    usage: Optional[Dict[str, Any]] = None,
+    api_duration: float = 0.0,
+    session_id: str = "",
+    task_id: str = "",
+    response_model: str = "",
+    assistant_content_chars: int = 0,
+    assistant_tool_call_count: int = 0,
+    reasoning_content: Optional[str] = None,
+    assistant_content: Optional[str] = None,
+    **_ignore: Any,
+) -> None:
+    """Called by hermes after each LLM API round-trip.
+
+    Captures exact token usage from hermes' normalised usage dict, emits a
+    PostLLMCall event so TokenGuard and other cost-tracking subscribers record
+    real spend, and caches the model so subsequent tool events can be tagged
+    with the model that selected them.
+    """
+    global _LAST_MODEL, _LAST_PROVIDER
+    _LAST_MODEL = response_model or model or ""
+    _LAST_PROVIDER = provider or ""
+
+    u = usage or {}
+    tok_in = int(u.get("prompt_tokens") or u.get("input_tokens") or 0)
+    tok_out = int(u.get("completion_tokens") or u.get("output_tokens") or 0)
+    total = int(u.get("total_tokens") or (tok_in + tok_out))
+
+    cache_key = task_id or session_id or "default"
+    corr = _CORRELATIONS.pop(cache_key, "")
+
+    envelope = _build_envelope(
+        event_type="PostLLMCall",
+        tool_name="llm.api_request",
+        tool_input={},
+        session_id=session_id,
+        task_id=task_id,
+        correlation_id=corr,
+        extra={
+            "model": _LAST_MODEL,
+            "provider": _LAST_PROVIDER,
+            "tokens_input": tok_in,
+            "tokens_output": tok_out,
+            "total_tokens": total,
+            "api_duration_ms": int(api_duration * 1000) if api_duration else 0,
+            "tool_calls_emitted": assistant_tool_call_count,
+            "assistant_content_chars": assistant_content_chars,
+            "reasoning_content": reasoning_content,
+            "reasoning_chars": len(reasoning_content or ""),
+            "response_content": assistant_content or "",
+        },
+    )
+    _post_event(envelope)
+    return None
+
+
 def on_pre_tool_call(
     tool_name: str,
     args: Dict[str, Any],
@@ -187,6 +303,10 @@ def on_pre_tool_call(
 
     Emits PreToolUse to HookBus. If any subscriber returns `deny`, block.
     """
+    corr = str(uuid.uuid4())
+    if tool_call_id:
+        _CORRELATIONS[tool_call_id] = corr
+
     envelope = _build_envelope(
         event_type="PreToolUse",
         tool_name=tool_name,
@@ -194,6 +314,7 @@ def on_pre_tool_call(
         session_id=session_id,
         tool_call_id=tool_call_id,
         task_id=task_id,
+        correlation_id=corr,
     )
 
     verdict = _post_event(envelope)
@@ -230,6 +351,8 @@ def on_post_tool_call(
     **_ignore: Any,
 ) -> None:
     """Emit PostToolUse, observation only."""
+    corr = _CORRELATIONS.pop(tool_call_id, "") if tool_call_id else ""
+
     envelope = _build_envelope(
         event_type="PostToolUse",
         tool_name=tool_name,
@@ -237,56 +360,8 @@ def on_post_tool_call(
         session_id=session_id,
         tool_call_id=tool_call_id,
         task_id=task_id,
+        correlation_id=corr,
         extra={"result_excerpt": str(result)[:500] if result is not None else ""},
-    )
-    _post_event(envelope)
-    return None
-
-
-def on_post_api_request(
-    model: str = "",
-    provider: str = "",
-    usage: Optional[Dict[str, Any]] = None,
-    api_duration: float = 0.0,
-    session_id: str = "",
-    task_id: str = "",
-    response_model: str = "",
-    assistant_content_chars: int = 0,
-    assistant_tool_call_count: int = 0,
-    **_ignore: Any,
-) -> None:
-    """Called by hermes after each LLM API round-trip.
-
-    Captures exact token usage from hermes' normalised usage dict, emits a
-    PostLLMCall event so TokenGuard and other cost-tracking subscribers record
-    real spend, and caches the model so subsequent tool events can be tagged
-    with the model that selected them.
-    """
-    global _LAST_MODEL, _LAST_PROVIDER
-    _LAST_MODEL = response_model or model or ""
-    _LAST_PROVIDER = provider or ""
-
-    u = usage or {}
-    tok_in = int(u.get("prompt_tokens") or u.get("input_tokens") or 0)
-    tok_out = int(u.get("completion_tokens") or u.get("output_tokens") or 0)
-    total = int(u.get("total_tokens") or (tok_in + tok_out))
-
-    envelope = _build_envelope(
-        event_type="PostLLMCall",
-        tool_name="llm.api_request",
-        tool_input={},
-        session_id=session_id,
-        task_id=task_id,
-        extra={
-            "model": _LAST_MODEL,
-            "provider": _LAST_PROVIDER,
-            "tokens_input": tok_in,
-            "tokens_output": tok_out,
-            "total_tokens": total,
-            "api_duration_ms": int(api_duration * 1000) if api_duration else 0,
-            "tool_calls_emitted": assistant_tool_call_count,
-            "assistant_content_chars": assistant_content_chars,
-        },
     )
     _post_event(envelope)
     return None
@@ -298,9 +373,10 @@ def on_post_api_request(
 
 def register(ctx: Any) -> None:
     """Called by hermes-agent's plugin loader at startup."""
+    ctx.register_hook("pre_api_request", on_pre_api_request)
+    ctx.register_hook("post_api_request", on_post_api_request)
     ctx.register_hook("pre_tool_call", on_pre_tool_call)
     ctx.register_hook("post_tool_call", on_post_tool_call)
-    ctx.register_hook("post_api_request", on_post_api_request)
     cfg = _config()
     logger.info(
         "hookbus-publisher %s registered: url=%s fail_mode=%s",
