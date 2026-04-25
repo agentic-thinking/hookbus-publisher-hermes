@@ -3,8 +3,9 @@
 Emits lifecycle events to a HookBus endpoint and enforces subscriber verdicts.
 
 Hooks registered:
+- pre_gateway_dispatch -> UserPromptSubmit event (sync, can drop the message)
 - pre_api_request -> PreLLMCall event (sync, can block/budget)
-- post_api_request -> PostLLMCall event (carries exact model + token usage)
+- post_api_request -> PostLLMCall event (carries model, tokens, reasoning_content, response_content)
 - pre_tool_call  -> PreToolUse event (sync, can block)
 - post_tool_call -> PostToolUse event (observation)
 
@@ -37,7 +38,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 
-__version__ = "0.2.2"
+__version__ = "0.3.0"
 
 logger = logging.getLogger(__name__)
 if os.environ.get("HOOKBUS_DEBUG", "") == "1":
@@ -367,12 +368,70 @@ def on_post_tool_call(
     return None
 
 
+def on_pre_gateway_dispatch(
+    event: Any = None,
+    gateway: Any = None,
+    session_store: Any = None,
+    **_ignore: Any,
+) -> Optional[Dict[str, Any]]:
+    """Called by hermes-agent gateway when a user message arrives, before auth.
+
+    Emits UserPromptSubmit to HookBus with the user's prompt text + source
+    attribution. If any subscriber returns `deny`, drop the message via
+    {"action": "skip", "reason": ...}; gateway will not dispatch to the agent.
+    """
+    if event is None:
+        return None
+
+    text = getattr(event, "text", "") or ""
+    src = getattr(event, "source", None)
+    platform = ""
+    chat_id = ""
+    user_id = ""
+    if src is not None:
+        plat = getattr(src, "platform", None)
+        platform = getattr(plat, "value", "") or (str(plat) if plat else "")
+        chat_id = str(getattr(src, "chat_id", "") or "")
+        user_id = str(getattr(src, "user_id", "") or "")
+
+    envelope = _build_envelope(
+        event_type="UserPromptSubmit",
+        tool_name="user.prompt",
+        tool_input={"prompt": text},
+        session_id=chat_id or "default",
+        correlation_id=str(uuid.uuid4()),
+        extra={
+            "platform": platform,
+            "chat_id": chat_id,
+            "user_id": user_id,
+            "prompt_chars": len(text),
+        },
+    )
+
+    verdict = _post_event(envelope)
+    cfg = _config()
+
+    if verdict is None:
+        if cfg["fail_mode"] == "closed":
+            return {"action": "skip", "reason": "HookBus unreachable and fail_mode=closed"}
+        return None
+
+    decision = str(verdict.get("decision", "allow")).lower()
+    reason = verdict.get("reason", "") or ""
+    if decision == "deny":
+        return {"action": "skip", "reason": reason or "Blocked by HookBus subscriber"}
+    if decision not in ("allow", "ask"):
+        logger.warning("hookbus returned unknown decision '%s' for UserPromptSubmit, defaulting to allow", decision)
+    return None
+
+
 # ---------------------------------------------------------------------------
 # hermes-agent plugin entry point
 # ---------------------------------------------------------------------------
 
 def register(ctx: Any) -> None:
     """Called by hermes-agent's plugin loader at startup."""
+    ctx.register_hook("pre_gateway_dispatch", on_pre_gateway_dispatch)
     ctx.register_hook("pre_api_request", on_pre_api_request)
     ctx.register_hook("post_api_request", on_post_api_request)
     ctx.register_hook("pre_tool_call", on_pre_tool_call)

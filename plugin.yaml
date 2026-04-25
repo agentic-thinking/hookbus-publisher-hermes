@@ -1,6 +1,6 @@
 name: hookbus-publisher
-version: 0.2.0
-description: Publish hermes-agent lifecycle events to HookBus, a vendor-neutral agent governance bus. Enforces pre-tool-call policy via CRE or any HookBus subscriber.
+version: 0.3.0
+description: Publish hermes-agent lifecycle events to HookBus, a vendor-neutral agent governance bus. Enforces pre-prompt, pre-LLM-call, and pre-tool-call policy via CRE or any HookBus subscriber.
 author: Agentic Thinking Ltd <contact@agenticthinking.uk>
 requires_env:
   - name: HOOKBUS_URL
@@ -13,6 +13,8 @@ requires_env:
     description: "Behaviour when bus is unreachable: 'open' (allow) or 'closed' (deny). Default 'open'."
     required: false
 provides_hooks:
+  - pre_gateway_dispatch
+  - pre_api_request
+  - post_api_request
   - pre_tool_call
   - post_tool_call
-  - post_api_request
