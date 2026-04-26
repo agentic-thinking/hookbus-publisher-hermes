@@ -430,10 +430,19 @@ def on_pre_gateway_dispatch(
 # ---------------------------------------------------------------------------
 
 def register(ctx: Any) -> None:
-    """Called by hermes-agent's plugin loader at startup."""
+    """Called by hermes-agent's plugin loader at startup.
+
+    Both the v0.9-era hook names (`pre_api_request`, `post_api_request`)
+    and the v0.11+ canonical names (`pre_llm_call`, `post_llm_call`) are
+    registered so the same plugin works on either runtime version. The
+    runtime invokes whichever names it knows; unknown names are stored
+    but never fired, so dual-registration is safe.
+    """
     ctx.register_hook("pre_gateway_dispatch", on_pre_gateway_dispatch)
-    ctx.register_hook("pre_api_request", on_pre_api_request)
-    ctx.register_hook("post_api_request", on_post_api_request)
+    ctx.register_hook("pre_api_request", on_pre_api_request)        # v0.9
+    ctx.register_hook("post_api_request", on_post_api_request)      # v0.9
+    ctx.register_hook("pre_llm_call", on_pre_api_request)           # v0.11
+    ctx.register_hook("post_llm_call", on_post_api_request)         # v0.11
     ctx.register_hook("pre_tool_call", on_pre_tool_call)
     ctx.register_hook("post_tool_call", on_post_tool_call)
     cfg = _config()
