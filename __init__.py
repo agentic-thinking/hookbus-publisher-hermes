@@ -32,6 +32,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import uuid
 import urllib.request
 from datetime import datetime, timezone
@@ -55,6 +56,12 @@ SCHEMA_VERSION = 1
 # tagged with the model that selected them. Reset per process.
 _LAST_MODEL: str = ""
 _LAST_PROVIDER: str = ""
+
+# Per-session memory of the last user_message seen on a pre_llm_call. Used to
+# detect a fresh user turn (initial or mid-session follow-up) so we publish
+# UserPromptSubmit + inject CRE's KB context once per user turn, not on every
+# LLM call inside a tool-use loop.
+_LAST_USER_MESSAGE: Dict[str, str] = {}
 
 # correlation_id cache: keyed by tool_call_id (tools) or task_id (LLM calls)
 _CORRELATIONS: Dict[str, str] = {}
@@ -191,11 +198,19 @@ def on_pre_api_request(
     provider: str = "",
     session_id: str = "",
     task_id: str = "",
+    user_message: str = "",
+    is_first_turn: bool = False,
     **_ignore: Any,
 ) -> Optional[Dict[str, Any]]:
     """Called by hermes-agent before an LLM API call.
 
     Emits PreLLMCall to HookBus. If any subscriber returns `deny`, block.
+
+    On the first turn of a session (CLI mode bypasses the gateway hook),
+    additionally fire a UserPromptSubmit event so the CRE subscriber gets
+    the prompt and returns its KB-augmented preprompt; we then inject it
+    into the model context via `{"context": ...}` (Hermes appends plugin
+    context to the user message before the LLM call).
     """
     corr = str(uuid.uuid4())
     cache_key = task_id or session_id or "default"
@@ -224,13 +239,44 @@ def on_pre_api_request(
     decision = str(verdict.get("decision", "allow")).lower()
     reason = verdict.get("reason", "") or ""
 
+    # CLI compat: gateway runs already fire UserPromptSubmit via
+    # pre_gateway_dispatch, but `hermes chat ...` (CLI) does not. We need
+    # KB context on every fresh user turn (initial OR mid-session follow-up),
+    # not just is_first_turn — Hermes' pre_llm_call fires for every LLM call
+    # in a tool-use loop, so we use the user_message-changed signal to fire
+    # exactly once per real user prompt.
+    sess = session_id or "default"
+    last_seen = _LAST_USER_MESSAGE.get(sess, "")
+    is_new_user_turn = bool(user_message) and user_message != last_seen
+    if user_message:
+        _LAST_USER_MESSAGE[sess] = user_message
+
+    cre_ctx = ""
+    if is_new_user_turn:
+        ups = _build_envelope(
+            event_type="UserPromptSubmit",
+            tool_name="user.prompt",
+            tool_input={"prompt": user_message},
+            session_id=sess,
+            correlation_id=str(uuid.uuid4()),
+        )
+        ups_verdict = _post_event(ups)
+        if ups_verdict and str(ups_verdict.get("decision", "allow")).lower() == "allow":
+            cre_ctx = _extract_cre_context(ups_verdict.get("reason", "") or "")
+
     if decision in ("deny", "ask"):
-        return {
+        response: Dict[str, Any] = {
             "action": "block",
             "message": reason or "Blocked by HookBus subscriber (no reason given).",
         }
+        if cre_ctx:
+            response["context"] = cre_ctx
+        return response
     if decision != "allow":
         logger.warning("hookbus returned unknown decision '%s' for PreLLMCall, defaulting to allow", decision)
+
+    if cre_ctx:
+        return {"context": cre_ctx}
     return None
 
 
@@ -422,7 +468,31 @@ def on_pre_gateway_dispatch(
         return {"action": "skip", "reason": reason or "Blocked by HookBus subscriber"}
     if decision != "allow":
         logger.warning("hookbus returned unknown decision '%s' for UserPromptSubmit, defaulting to allow", decision)
+
+    # Inject CRE's KB-augmented preprompt into the user message so it reaches
+    # the model. CRE puts its context in `reason`; the bus consolidates with
+    # `[<subscriber>] ...; [<next>] ...` formatting. We pluck out only the
+    # `[cre]` chunk to avoid injecting other subscribers' status messages
+    # (DLP clean / KB no matches / orchestrator no conflicts / etc.).
+    cre_ctx = _extract_cre_context(reason)
+    if cre_ctx:
+        return {
+            "action": "rewrite",
+            "text": cre_ctx + "\n\n" + text,
+        }
     return None
+
+
+def _extract_cre_context(reason: str) -> str:
+    """Pull the CRE subscriber's reason chunk out of the bus's consolidated
+    reason string. Format: ``[cre] <preprompt>; [kb-injector] ...``."""
+    if not reason:
+        return ""
+    chunks = re.split(r";\s*(?=\[[\w-]+\])", reason)
+    for chunk in chunks:
+        if chunk.startswith("[cre] "):
+            return chunk[6:].strip()
+    return ""
 
 
 # ---------------------------------------------------------------------------
