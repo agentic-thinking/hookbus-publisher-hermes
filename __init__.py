@@ -224,12 +224,12 @@ def on_pre_api_request(
     decision = str(verdict.get("decision", "allow")).lower()
     reason = verdict.get("reason", "") or ""
 
-    if decision == "deny":
+    if decision in ("deny", "ask"):
         return {
             "action": "block",
             "message": reason or "Blocked by HookBus subscriber (no reason given).",
         }
-    if decision not in ("allow", "ask"):
+    if decision != "allow":
         logger.warning("hookbus returned unknown decision '%s' for PreLLMCall, defaulting to allow", decision)
     return None
 
@@ -332,12 +332,12 @@ def on_pre_tool_call(
     decision = str(verdict.get("decision", "allow")).lower()
     reason = verdict.get("reason", "") or ""
 
-    if decision == "deny":
+    if decision in ("deny", "ask"):
         return {
             "action": "block",
             "message": reason or "Blocked by HookBus subscriber (no reason given).",
         }
-    if decision not in ("allow", "ask"):
+    if decision != "allow":
         logger.warning("hookbus returned unknown decision '%s' for PreToolUse, defaulting to allow", decision)
     return None
 
@@ -418,9 +418,9 @@ def on_pre_gateway_dispatch(
 
     decision = str(verdict.get("decision", "allow")).lower()
     reason = verdict.get("reason", "") or ""
-    if decision == "deny":
+    if decision in ("deny", "ask"):
         return {"action": "skip", "reason": reason or "Blocked by HookBus subscriber"}
-    if decision not in ("allow", "ask"):
+    if decision != "allow":
         logger.warning("hookbus returned unknown decision '%s' for UserPromptSubmit, defaulting to allow", decision)
     return None
 
