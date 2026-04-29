@@ -4,9 +4,11 @@ Publishes hermes-agent lifecycle events to **HookBus**, the vendor-neutral runti
 
 ## What it does
 
+- Registers a `pre_gateway_dispatch` hook that emits `UserPromptSubmit` for gateway messages.
+- Registers `pre_api_request` / `pre_llm_call` hooks that emit `PreLLMCall`.
+- Registers `post_api_request` / `post_llm_call` hooks that emit `PostLLMCall` with token usage, model attribution, response content, and reasoning content when available.
 - Registers a `pre_tool_call` hook that posts a `PreToolUse` event to HookBus before every tool executes. If any subscriber returns `deny`, hermes blocks the tool call with the reason.
 - Registers a `post_tool_call` hook that emits `PostToolUse` observationally.
-- Registers an `llm_output` hook that emits `PostLLMCall` with token usage and model attribution.
 
 ## Install (60 seconds)
 
@@ -59,9 +61,9 @@ Hermes auto-discovers plugins in that directory on next start.
 | Env var | Default | Purpose |
 |---|---|---|
 | `HOOKBUS_URL` | `http://localhost:18800/event` | HookBus endpoint |
-| `HOOKBUS_TOKEN` | *(empty)* | Bearer token. **Required** if the bus has auth enabled (default since v0.4). Read once: `docker exec hookbus cat /root/.hookbus/.token` and export to your shell |
+| `HOOKBUS_TOKEN` | *(empty)* | Bearer token. **Required** if the bus has auth enabled (default since v0.1). Read once: `docker exec hookbus cat /root/.hookbus/.token` and export to your shell |
 | `HOOKBUS_TIMEOUT` | `10` | Seconds to wait for bus verdict |
-| `HOOKBUS_FAIL_MODE` | `open` | `open` = allow on bus failure, `closed` = deny |
+| `HOOKBUS_FAIL_MODE` | `closed` | `open` = allow on bus failure, `closed` = deny |
 | `HOOKBUS_SOURCE` | `hermes-agent` | Source label in envelope |
 
 Persist these across Hermes restarts by adding them to `~/hermes-agent/.env`:

@@ -33,8 +33,10 @@ import json
 import logging
 import os
 import re
+import threading
 import uuid
 import urllib.request
+from collections import OrderedDict
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 from urllib.parse import urlparse
@@ -64,7 +66,59 @@ _LAST_PROVIDER: str = ""
 _LAST_USER_MESSAGE: Dict[str, str] = {}
 
 # correlation_id cache: keyed by tool_call_id (tools) or task_id (LLM calls)
-_CORRELATIONS: Dict[str, str] = {}
+_CORRELATIONS: "OrderedDict[str, str]" = OrderedDict()
+_STATE_LOCK = threading.RLock()
+_MAX_TRACKED_STATE = 2048
+
+
+def _trim_ordered_dict(data: OrderedDict, max_size: int = _MAX_TRACKED_STATE) -> None:
+    """Bound plugin bookkeeping so abandoned hook pairs cannot leak forever."""
+    while len(data) > max_size:
+        data.popitem(last=False)
+
+
+def _put_correlation(key: str, correlation_id: str) -> None:
+    if not key:
+        return
+    with _STATE_LOCK:
+        _CORRELATIONS[key] = correlation_id
+        _CORRELATIONS.move_to_end(key)
+        _trim_ordered_dict(_CORRELATIONS)
+
+
+def _pop_correlation(key: str) -> str:
+    if not key:
+        return ""
+    with _STATE_LOCK:
+        return _CORRELATIONS.pop(key, "")
+
+
+def _remember_user_message(session_id: str, user_message: str) -> bool:
+    """Return True once per fresh user prompt for the given session."""
+    if not user_message:
+        return False
+    session_key = session_id or "default"
+    with _STATE_LOCK:
+        last_seen = _LAST_USER_MESSAGE.get(session_key, "")
+        is_new = user_message != last_seen
+        _LAST_USER_MESSAGE[session_key] = user_message
+        if len(_LAST_USER_MESSAGE) > _MAX_TRACKED_STATE:
+            # Dict insertion order is stable; drop the oldest session entry.
+            oldest = next(iter(_LAST_USER_MESSAGE))
+            _LAST_USER_MESSAGE.pop(oldest, None)
+        return is_new
+
+
+def _cache_model(provider: str, model: str) -> None:
+    global _LAST_MODEL, _LAST_PROVIDER
+    with _STATE_LOCK:
+        _LAST_MODEL = model
+        _LAST_PROVIDER = provider
+
+
+def _cached_model_provider() -> tuple[str, str]:
+    with _STATE_LOCK:
+        return _LAST_MODEL, _LAST_PROVIDER
 
 
 def _config() -> Dict[str, Any]:
@@ -151,10 +205,11 @@ def _post_event(envelope: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 def _merge_meta(base: Dict[str, Any], extra: Dict[str, Any]) -> Dict[str, Any]:
     """Merge metadata, auto-injecting cached model/provider where absent."""
     merged = {**base, **extra}
-    if _LAST_MODEL and "model" not in merged:
-        merged["model"] = _LAST_MODEL
-    if _LAST_PROVIDER and "provider" not in merged:
-        merged["provider"] = _LAST_PROVIDER
+    last_model, last_provider = _cached_model_provider()
+    if last_model and "model" not in merged:
+        merged["model"] = last_model
+    if last_provider and "provider" not in merged:
+        merged["provider"] = last_provider
     return merged
 
 
@@ -214,7 +269,7 @@ def on_pre_api_request(
     """
     corr = str(uuid.uuid4())
     cache_key = task_id or session_id or "default"
-    _CORRELATIONS[cache_key] = corr
+    _put_correlation(cache_key, corr)
 
     envelope = _build_envelope(
         event_type="PreLLMCall",
@@ -246,10 +301,7 @@ def on_pre_api_request(
     # in a tool-use loop, so we use the user_message-changed signal to fire
     # exactly once per real user prompt.
     sess = session_id or "default"
-    last_seen = _LAST_USER_MESSAGE.get(sess, "")
-    is_new_user_turn = bool(user_message) and user_message != last_seen
-    if user_message:
-        _LAST_USER_MESSAGE[sess] = user_message
+    is_new_user_turn = _remember_user_message(sess, user_message)
 
     cre_ctx = ""
     if is_new_user_turn:
@@ -301,9 +353,9 @@ def on_post_api_request(
     real spend, and caches the model so subsequent tool events can be tagged
     with the model that selected them.
     """
-    global _LAST_MODEL, _LAST_PROVIDER
-    _LAST_MODEL = response_model or model or ""
-    _LAST_PROVIDER = provider or ""
+    current_model = response_model or model or ""
+    current_provider = provider or ""
+    _cache_model(current_provider, current_model)
 
     u = usage or {}
     tok_in = int(u.get("prompt_tokens") or u.get("input_tokens") or 0)
@@ -311,7 +363,7 @@ def on_post_api_request(
     total = int(u.get("total_tokens") or (tok_in + tok_out))
 
     cache_key = task_id or session_id or "default"
-    corr = _CORRELATIONS.pop(cache_key, "")
+    corr = _pop_correlation(cache_key)
 
     envelope = _build_envelope(
         event_type="PostLLMCall",
@@ -321,8 +373,8 @@ def on_post_api_request(
         task_id=task_id,
         correlation_id=corr,
         extra={
-            "model": _LAST_MODEL,
-            "provider": _LAST_PROVIDER,
+            "model": current_model,
+            "provider": current_provider,
             "tokens_input": tok_in,
             "tokens_output": tok_out,
             "total_tokens": total,
@@ -352,7 +404,7 @@ def on_pre_tool_call(
     """
     corr = str(uuid.uuid4())
     if tool_call_id:
-        _CORRELATIONS[tool_call_id] = corr
+        _put_correlation(tool_call_id, corr)
 
     envelope = _build_envelope(
         event_type="PreToolUse",
@@ -398,7 +450,7 @@ def on_post_tool_call(
     **_ignore: Any,
 ) -> None:
     """Emit PostToolUse, observation only."""
-    corr = _CORRELATIONS.pop(tool_call_id, "") if tool_call_id else ""
+    corr = _pop_correlation(tool_call_id) if tool_call_id else ""
 
     envelope = _build_envelope(
         event_type="PostToolUse",
@@ -439,6 +491,8 @@ def on_pre_gateway_dispatch(
         platform = getattr(plat, "value", "") or (str(plat) if plat else "")
         chat_id = str(getattr(src, "chat_id", "") or "")
         user_id = str(getattr(src, "user_id", "") or "")
+    if text:
+        _remember_user_message(chat_id or "default", text)
 
     envelope = _build_envelope(
         event_type="UserPromptSubmit",
