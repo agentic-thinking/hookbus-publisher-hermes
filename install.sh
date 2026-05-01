@@ -8,6 +8,8 @@
 #   4. Copies this plugin\s __init__.py + plugin.yaml into ~/.hermes/plugins/hookbus-publisher/ (user plugin dir hermes actually scans)
 #   5. Scaffolds ~/hermes-agent/.env from .env.example if missing
 #   6. Prompts for MINIMAX_API_KEY if not present
+#   7. Installs ~/.local/bin/hermes so the normal `hermes` command launches
+#      the installed Hermes runtime with the HookBus plugin available.
 #
 # Env overrides (all optional):
 #   HERMES_DIR          default ~/hermes-agent
@@ -22,6 +24,8 @@ HERMES_DIR="${HERMES_DIR:-$HOME/hermes-agent}"
 PLUGIN_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HOOKBUS_URL="${HOOKBUS_URL:-http://localhost:18800/event}"
 HOOKBUS_FAIL_MODE="${HOOKBUS_FAIL_MODE:-closed}"
+BIN_DIR="$HOME/.local/bin"
+HERMES_SHIM="$BIN_DIR/hermes"
 
 say() { printf "\033[1;32m[hermes-install]\033[0m %s\n" "$*" >&2; }
 warn() { printf "\033[1;33m[hermes-install]\033[0m %s\n" "$*" >&2; }
@@ -101,4 +105,26 @@ fi
 say "install complete."
 say "Plugin:      $HERMES_USER_PLUGIN_DIR/"
 say "Bus target:  $HOOKBUS_URL"
-say "Start chat:  $HERMES_DIR/hermes chat"
+
+mkdir -p "$BIN_DIR"
+if [ -e "$HERMES_SHIM" ] && ! grep -q "HookBus-managed hermes shim" "$HERMES_SHIM" 2>/dev/null; then
+    warn "$HERMES_SHIM already exists and is not HookBus-managed; leaving it unchanged."
+    warn "Run directly with: $HERMES_DIR/hermes chat"
+else
+    cat > "$HERMES_SHIM" <<EOF
+#!/usr/bin/env bash
+# HookBus-managed hermes shim. Runs the installed Hermes runtime.
+set -euo pipefail
+HERMES_DIR="$HERMES_DIR"
+cd "\$HERMES_DIR"
+if [ -f "\$HERMES_DIR/venv/bin/activate" ]; then
+    # shellcheck disable=SC1091
+    source "\$HERMES_DIR/venv/bin/activate"
+fi
+exec "\$HERMES_DIR/hermes" "\$@"
+EOF
+    chmod 755 "$HERMES_SHIM"
+    say "installed normal-command shim at $HERMES_SHIM"
+fi
+
+say "Start chat:  hermes chat"

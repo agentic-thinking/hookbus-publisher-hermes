@@ -18,7 +18,8 @@
 #   - Strips any stale HOOKBUS_TOKEN line from ~/.hermes/.env and
 #     ~/hermes-agent/.env so the fresh shell value wins
 #   - Exports HOOKBUS_URL, HOOKBUS_TOKEN, HOOKBUS_FAIL_MODE
-#   - Execs the real hermes CLI with your args
+#   - Execs the real hermes CLI with your args. The installer also creates
+#     ~/.local/bin/hermes so users can type the normal `hermes` command.
 
 set -euo pipefail
 
