@@ -33,8 +33,17 @@ die() { printf "\033[1;31m[hermes-install] error:\033[0m %s\n" "$*" >&2; exit 1;
 
 # 1. Clone if needed
 if [[ ! -d "$HERMES_DIR/.git" ]]; then
-    say "cloning NousResearch/hermes-agent -> $HERMES_DIR"
-    git clone --quiet --depth 1 https://github.com/NousResearch/hermes-agent.git "$HERMES_DIR"
+    if [[ -d "$HERMES_DIR" ]] && [[ -n "$(find "$HERMES_DIR" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
+        if [[ -f "$HERMES_DIR/hermes" ]] || [[ -f "$HERMES_DIR/pyproject.toml" ]]; then
+            warn "$HERMES_DIR exists and is not a git checkout; using it as an existing Hermes install."
+        else
+            die "$HERMES_DIR exists and is not empty. Set HERMES_DIR to an existing Hermes checkout or remove the directory."
+        fi
+    else
+        rm -rf "$HERMES_DIR"
+        say "cloning NousResearch/hermes-agent -> $HERMES_DIR"
+        git clone --quiet --depth 1 https://github.com/NousResearch/hermes-agent.git "$HERMES_DIR"
+    fi
 fi
 
 # 2. venv
